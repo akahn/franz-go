@@ -1,25 +1,30 @@
 // Shows that with DisableIdempotentWrite, cancelling one record's Produce
-// context makes franz-go send a produce request whose records field is null
-// for another record's batch on the same partition. That record was produced
-// with context.Background() and never cancelled. No broker error is involved.
+// context makes kgo write a produce request whose records field is null. The
+// null batch belongs to a different record, which was never cancelled. No
+// broker error is involved.
 //
-// One broker, two partitions, MaxProduceRequestsInflightPerBroker(5) as in our
-// production config. Writes on the produce connection are slowed with a
-// net.Conn set through kgo.Dialer:
-//  1. Request 1 (record A, partition 1) is held mid-write, so the next
-//     requests wait behind it on the connection.
-//  2. Request 2 (record B, partition 0, cancellable ctx), request 3 (record
-//     D, partition 1), and request 4 (record C, partition 0, Background ctx)
-//     are built and wait. B's batch is partition 0's first batch.
-//  3. B's ctx is cancelled. When request 1's write is released, request 2
-//     fails with context canceled before it is written. kgo fails every
-//     partition 0 batch, including C's, which request 4 holds.
-//  4. Request 3's write is slow (held until B's promise has run), so request
-//     4 is serialized after C's batch was failed.
+// One broker, two partitions, MaxProduceRequestsInflightPerBroker(5) and
+// acks=1, as in our production config. Each record gets its own produce
+// request. A net.Conn set through kgo.Dialer holds chosen writes, so requests
+// built after a held one queue behind it, and logs each produce request as it
+// is written.
 //
-// NO_CANCEL=1 is the control: the same steps without cancelling B.
-// The client decodes every produce request it writes to the socket. Exit
-// status 0 means a request with null records was written.
+//  1. Produce A (partition 1) and hold its write.
+//  2. Produce B (partition 0, cancellable context), D (partition 1, write also
+//     held) and C (partition 0, context.Background()). Their requests are
+//     built and queue behind A's. B's batch is partition 0's first batch.
+//  3. Cancel B's context, then release A's write. kgo fails B's request
+//     before writing it. With idempotence disabled, it then fails every batch
+//     of partition 0, so B's and C's promises both get context.Canceled.
+//  4. Release D's write. D's write was held until now so that C's request is
+//     serialized only after C's batch was failed. kgo writes C's request
+//     anyway, with records=null for partition 0.
+//
+// NO_CANCEL=1 is the control: the same steps without the cancel in step 3.
+// All four requests are written with their records and every promise
+// succeeds.
+//
+// Exit status 0 means a produce request with null records was written.
 package main
 
 import (
@@ -29,7 +34,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kfake"
@@ -40,19 +48,20 @@ import (
 const topic = "t"
 
 var (
-	nullsMu sync.Mutex
-	nulls   []string
+	markerRe  = regexp.MustCompile(`MARK-[A-D]`)
+	logWrites atomic.Bool // false during warmup
+	sawNull   atomic.Bool
 )
 
-// recordNulls decodes a produce request as written to the socket and records
-// every partition whose records field is null.
-func recordNulls(b []byte) {
+// logProduce decodes a produce request as written to the socket and prints
+// each partition with the records it carries, or records=null.
+func logProduce(b []byte) {
 	if len(b) < 14 || int16(binary.BigEndian.Uint16(b[4:])) != int16(kmsg.Produce) {
 		return
 	}
 	req := kmsg.NewPtrProduceRequest()
 	req.Version = int16(binary.BigEndian.Uint16(b[6:]))
-	body := b[12:]
+	body := b[12:] // past length, key, version and correlation ID
 	clientIDLen := int(int16(binary.BigEndian.Uint16(body)))
 	body = body[2:]
 	if clientIDLen > 0 {
@@ -67,16 +76,21 @@ func recordNulls(b []byte) {
 	}
 	for _, t := range req.Topics {
 		for _, p := range t.Partitions {
-			if p.Records == nil {
-				nullsMu.Lock()
-				nulls = append(nulls, fmt.Sprintf("produce request v%d, acks=%d: partition %d has records=null", req.Version, req.Acks, p.Partition))
-				nullsMu.Unlock()
+			records := "null"
+			if p.Records != nil {
+				records = strings.Join(markerRe.FindAllString(string(p.Records), -1), ",")
+			} else {
+				sawNull.Store(true)
+			}
+			if logWrites.Load() {
+				fmt.Printf("  write:   produce v%d acks=%d, partition %d, records=%s\n", req.Version, req.Acks, p.Partition, records)
 			}
 		}
 	}
 }
 
-// slowConn holds writes that carry any marker in held.
+// slowConn holds writes that carry any marker in held, then logs them as they
+// go to the socket.
 type slowConn struct {
 	net.Conn
 	mu   *sync.Mutex
@@ -85,12 +99,12 @@ type slowConn struct {
 }
 
 func (c slowConn) Write(b []byte) (int, error) {
-	recordNulls(b)
 	c.mu.Lock()
 	for c.isHeld(b) {
 		c.cond.Wait()
 	}
 	c.mu.Unlock()
+	logProduce(b)
 	return c.Conn.Write(b)
 }
 
@@ -104,6 +118,8 @@ func (c slowConn) isHeld(b []byte) bool {
 }
 
 func main() {
+	cancel := os.Getenv("NO_CANCEL") == ""
+
 	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(2, topic))
 	if err != nil {
 		panic(err)
@@ -124,8 +140,11 @@ func main() {
 		kgo.SeedBrokers(c.ListenAddrs()...),
 		kgo.DefaultProduceTopic(topic),
 		kgo.DisableIdempotentWrite(),
+		kgo.RequiredAcks(kgo.LeaderAck()),
 		kgo.MaxProduceRequestsInflightPerBroker(5),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		// Uncompressed, so slowConn can find each record's marker.
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
 		kgo.Dialer(func(ctx context.Context, network, host string) (net.Conn, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, network, host)
 			if err != nil {
@@ -146,14 +165,15 @@ func main() {
 			panic(err)
 		}
 	}
+	logWrites.Store(true)
 
 	var wg sync.WaitGroup
 	bDone := make(chan struct{})
-	produce := func(ctx context.Context, value string, partition int32) {
+	produce := func(ctx context.Context, name string, partition int32) {
 		wg.Add(1)
-		cl.Produce(ctx, &kgo.Record{Partition: partition, Value: []byte(value)}, func(r *kgo.Record, err error) {
-			fmt.Printf("promise: %s partition %d err=%v\n", value, r.Partition, err)
-			if value == "MARK-B" {
+		cl.Produce(ctx, &kgo.Record{Partition: partition, Value: []byte("MARK-" + name)}, func(r *kgo.Record, err error) {
+			fmt.Printf("  promise: %s (partition %d) err=%v\n", name, r.Partition, err)
+			if name == "B" {
 				close(bDone)
 			}
 			wg.Done()
@@ -161,27 +181,31 @@ func main() {
 		time.Sleep(100 * time.Millisecond) // longer than the default 10ms linger: each record gets its own request
 	}
 
+	fmt.Println("step 1: produce A (partition 1), write held")
 	setHeld("MARK-A", true)
 	setHeld("MARK-D", true)
+	produce(context.Background(), "A", 1)
 
-	produce(context.Background(), "MARK-A", 1)
+	fmt.Println("step 2: produce B (partition 0, cancellable ctx), D (partition 1, write held), C (partition 0, context.Background())")
 	ctxB, cancelB := context.WithCancel(context.Background())
-	produce(ctxB, "MARK-B", 0)
-	produce(context.Background(), "MARK-D", 1)
-	produce(context.Background(), "MARK-C", 0)
+	produce(ctxB, "B", 0)
+	produce(context.Background(), "D", 1)
+	produce(context.Background(), "C", 0)
 
-	cancelled := os.Getenv("NO_CANCEL") == ""
-	if cancelled {
-		fmt.Println("cancel: record B's context")
+	if cancel {
+		fmt.Println("step 3: cancel B's context, release A's write")
 		cancelB()
+	} else {
+		fmt.Println("step 3: (NO_CANCEL) release A's write")
 	}
-
 	setHeld("MARK-A", false)
-	if cancelled {
+	if cancel {
 		<-bDone // B's promise runs after kgo failed partition 0's batches
 	} else {
 		time.Sleep(500 * time.Millisecond)
 	}
+
+	fmt.Println("step 4: release D's write")
 	setHeld("MARK-D", false)
 
 	done := make(chan struct{})
@@ -193,13 +217,9 @@ func main() {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	nullsMu.Lock()
-	defer nullsMu.Unlock()
-	if len(nulls) == 0 {
+	if !sawNull.Load() {
 		fmt.Println("RESULT: no produce request with null records was written")
 		os.Exit(1)
 	}
-	for _, s := range nulls {
-		fmt.Println("RESULT:", s)
-	}
+	fmt.Println("RESULT: a produce request with null records was written")
 }
