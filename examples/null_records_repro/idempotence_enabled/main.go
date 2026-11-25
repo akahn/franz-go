@@ -1,28 +1,31 @@
-// Shows that franz-go, with its default idempotent producer settings, can send
-// a produce request whose records field is null for a batch that was failed
-// after the request was built but before it was serialized.
+// Shows that with kgo's default idempotent producer, a broker error on one
+// request makes kgo write a later produce request whose records field is null.
 //
-// One broker, one partition. Sequence, driven by kfake and a net.Conn set
-// through kgo.Dialer:
-//  1. A warmup produce succeeds; kgo only pipelines a partition's batches
-//     once it has had a successful produce on the broker.
-//  2. Request 1 (record B) reaches the broker, which holds its response.
-//  3. Request 2 (record A) is held mid-write, so request 3 (record C) is
-//     built and waits behind it unserialized.
-//  4. The broker answers request 1 with an error (see MODE). kgo fails every
-//     batch of the partition, including C's, which request 3 holds.
-//  5. Request 2's write is released, and request 3 is serialized with a
-//     null records placeholder for C's batch.
+// One broker, one partition. kfake holds and then fails the broker's response
+// to the first request. A net.Conn set through kgo.Dialer holds one write, so
+// the request built after it queues behind it, and logs each produce request
+// as it is written.
 //
-// MODE selects the broker's answer to request 1:
+//  1. Produce A. The broker receives A's request and holds its response.
+//  2. Produce B, whose write is held, then C. C's request is built and queues
+//     behind B's.
+//  3. Set up the error (see MODE), then let the broker answer A's request.
+//     kgo fails every batch of the partition: A's, B's and C's promises all
+//     get the error.
+//  4. Release B's write. B's request was serialized before the failure, so it
+//     is written with its records. C's request is serialized after the
+//     failure, and kgo writes it anyway, with records=null.
 //
-//	fatal    (default) INVALID_RECORD, a non-retryable error
-//	timeout  NOT_LEADER_OR_FOLLOWER after B passed a 1s RecordDeliveryTimeout
-//	cancel   NOT_LEADER_OR_FOLLOWER after B's Produce context was cancelled
-//	none     control: success
+// MODE selects the error in step 3:
 //
-// The client decodes every produce request it writes to the socket. Exit
-// status 0 means a request with null records was written.
+//	fatal    (default) the broker answers INVALID_RECORD, which is not retryable
+//	timeout  A passes a 1s RecordDeliveryTimeout, then the broker answers
+//	         NOT_LEADER_FOR_PARTITION (retryable)
+//	cancel   A's Produce context is cancelled, then the broker answers
+//	         NOT_LEADER_FOR_PARTITION (retryable)
+//	none     control: the same steps, but the broker answers successfully
+//
+// Exit status 0 means a produce request with null records was written.
 package main
 
 import (
@@ -32,7 +35,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -44,19 +50,20 @@ import (
 const topic = "t"
 
 var (
-	nullsMu sync.Mutex
-	nulls   []string
+	markerRe  = regexp.MustCompile(`MARK-[A-C]`)
+	logWrites atomic.Bool // false during warmup
+	sawNull   atomic.Bool
 )
 
-// recordNulls decodes a produce request as written to the socket and records
-// every partition whose records field is null.
-func recordNulls(b []byte) {
+// logProduce decodes a produce request as written to the socket and prints
+// each partition with the records it carries, or records=null.
+func logProduce(b []byte) {
 	if len(b) < 14 || int16(binary.BigEndian.Uint16(b[4:])) != int16(kmsg.Produce) {
 		return
 	}
 	req := kmsg.NewPtrProduceRequest()
 	req.Version = int16(binary.BigEndian.Uint16(b[6:]))
-	body := b[12:]
+	body := b[12:] // past length, key, version and correlation ID
 	clientIDLen := int(int16(binary.BigEndian.Uint16(body)))
 	body = body[2:]
 	if clientIDLen > 0 {
@@ -71,29 +78,35 @@ func recordNulls(b []byte) {
 	}
 	for _, t := range req.Topics {
 		for _, p := range t.Partitions {
-			if p.Records == nil {
-				nullsMu.Lock()
-				nulls = append(nulls, fmt.Sprintf("produce request v%d, acks=%d: partition %d has records=null", req.Version, req.Acks, p.Partition))
-				nullsMu.Unlock()
+			records := "null"
+			if p.Records != nil {
+				records = strings.Join(markerRe.FindAllString(string(p.Records), -1), ",")
+			} else {
+				sawNull.Store(true)
+			}
+			if logWrites.Load() {
+				fmt.Printf("  write:   produce v%d acks=%d, partition %d, records=%s\n", req.Version, req.Acks, p.Partition, records)
 			}
 		}
 	}
 }
 
+// holdConn holds writes of B's request while holdB is set, then logs each
+// write as it goes to the socket.
 type holdConn struct {
 	net.Conn
 	mu    *sync.Mutex
 	cond  *sync.Cond
-	holdA *bool
+	holdB *bool
 }
 
 func (c holdConn) Write(b []byte) (int, error) {
-	recordNulls(b)
 	c.mu.Lock()
-	for *c.holdA && bytes.Contains(b, []byte("MARK-A")) {
+	for *c.holdB && bytes.Contains(b, []byte("MARK-B")) {
 		c.cond.Wait()
 	}
 	c.mu.Unlock()
+	logProduce(b)
 	return c.Conn.Write(b)
 }
 
@@ -109,22 +122,28 @@ func main() {
 	}
 	defer c.Close()
 
-	sawB, wakeB := make(chan struct{}), make(chan struct{})
-	var sawBOnce sync.Once
+	// The broker holds its response to A's request until answerA is closed,
+	// then fails every partition in it (or, with MODE=none, succeeds).
+	gotA, answerA := make(chan struct{}), make(chan struct{})
+	var gotAOnce sync.Once
 	c.KeepControl()
 	c.ControlKey(int16(kmsg.Produce), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
 		req := kreq.(*kmsg.ProduceRequest)
-		hasB := false
+		hasA := false
 		for _, t := range req.Topics {
 			for _, p := range t.Partitions {
-				hasB = hasB || bytes.Contains(p.Records, []byte("MARK-B"))
+				hasA = hasA || bytes.Contains(p.Records, []byte("MARK-A"))
 			}
 		}
-		if !hasB || mode == "none" {
+		if !hasA {
 			return nil, nil, false
 		}
-		sawBOnce.Do(func() { close(sawB) })
-		c.SleepControl(func() { <-wakeB })
+		gotAOnce.Do(func() { close(gotA) })
+		c.SleepControl(func() { <-answerA })
+		if mode == "none" {
+			fmt.Println("  broker:  answering A's request successfully")
+			return nil, nil, false // kfake handles the request normally
+		}
 
 		code := kerr.InvalidRecord.Code
 		if mode != "fatal" {
@@ -142,24 +161,27 @@ func main() {
 			}
 			resp.Topics = append(resp.Topics, rt)
 		}
-		fmt.Printf("broker: answering request with record B: %v\n", kerr.ErrorForCode(code))
+		fmt.Printf("  broker:  answering A's request with %s\n", kerr.ErrorForCode(code).(*kerr.Error).Message)
 		return resp, nil, true
 	})
 
 	var (
 		hmu   sync.Mutex
-		holdA bool
+		holdB bool
 	)
 	hcond := sync.NewCond(&hmu)
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(c.ListenAddrs()...),
 		kgo.DefaultProduceTopic(topic),
+		// Uncompressed, so the broker and holdConn can find each record's
+		// marker.
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
 		kgo.Dialer(func(ctx context.Context, network, host string) (net.Conn, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, network, host)
 			if err != nil {
 				return nil, err
 			}
-			return holdConn{conn, &hmu, hcond, &holdA}, nil
+			return holdConn{conn, &hmu, hcond, &holdB}, nil
 		}),
 	}
 	if mode == "timeout" {
@@ -171,50 +193,58 @@ func main() {
 	}
 	defer cl.Close()
 
+	// kgo pipelines a partition's batches only after a successful produce
+	// to it on that broker.
 	if err := cl.ProduceSync(context.Background(), &kgo.Record{Value: []byte("warmup")}).FirstErr(); err != nil {
 		panic(err)
 	}
+	logWrites.Store(true)
 
 	var wg sync.WaitGroup
-	bDone := make(chan struct{})
-	produce := func(ctx context.Context, value string) {
+	aDone := make(chan struct{})
+	produce := func(ctx context.Context, name string) {
 		wg.Add(1)
-		cl.Produce(ctx, &kgo.Record{Value: []byte(value)}, func(r *kgo.Record, err error) {
-			fmt.Printf("promise: %s err=%v\n", value, err)
-			if value == "MARK-B" {
-				close(bDone)
+		cl.Produce(ctx, &kgo.Record{Value: []byte("MARK-" + name)}, func(_ *kgo.Record, err error) {
+			fmt.Printf("  promise: %s err=%v\n", name, err)
+			if name == "A" {
+				close(aDone)
 			}
 			wg.Done()
 		})
 	}
 
-	ctxB, cancelB := context.WithCancel(context.Background())
-	produce(ctxB, "MARK-B")
-	if mode != "none" {
-		<-sawB
-	}
+	fmt.Println("step 1: produce A, broker holds its response")
+	ctxA, cancelA := context.WithCancel(context.Background())
+	produce(ctxA, "A")
+	<-gotA
 
+	fmt.Println("step 2: produce B (write held), then C")
 	hmu.Lock()
-	holdA = true
+	holdB = true
 	hmu.Unlock()
-	produce(context.Background(), "MARK-A")
+	produce(context.Background(), "B")
 	time.Sleep(100 * time.Millisecond) // longer than the default 10ms linger, so C gets its own request
-	produce(context.Background(), "MARK-C")
+	produce(context.Background(), "C")
 	time.Sleep(100 * time.Millisecond)
 
 	switch mode {
-	case "cancel":
-		cancelB()
+	case "fatal":
+		fmt.Println("step 3: broker answers A's request")
 	case "timeout":
+		fmt.Println("step 3: wait past A's 1s RecordDeliveryTimeout, then broker answers A's request")
 		time.Sleep(1200 * time.Millisecond)
+	case "cancel":
+		fmt.Println("step 3: cancel A's context, then broker answers A's request")
+		cancelA()
+	case "none":
+		fmt.Println("step 3: (MODE=none) broker answers A's request successfully")
 	}
-	if mode != "none" {
-		close(wakeB)
-		<-bDone // B's promise runs after kgo failed the partition's batches
-	}
+	close(answerA)
+	<-aDone // A's promise has run, so kgo has handled the broker's answer
 
+	fmt.Println("step 4: release B's write")
 	hmu.Lock()
-	holdA = false
+	holdB = false
 	hmu.Unlock()
 	hcond.Broadcast()
 
@@ -227,13 +257,9 @@ func main() {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	nullsMu.Lock()
-	defer nullsMu.Unlock()
-	if len(nulls) == 0 {
+	if !sawNull.Load() {
 		fmt.Println("RESULT: no produce request with null records was written")
 		os.Exit(1)
 	}
-	for _, s := range nulls {
-		fmt.Println("RESULT:", s)
-	}
+	fmt.Println("RESULT: a produce request with null records was written")
 }

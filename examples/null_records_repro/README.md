@@ -73,17 +73,55 @@ answers it.
 
 ## idempotence_enabled
 
-This uses kgo's default idempotent producer. The broker answers an earlier
-request with an error for the partition, and kgo fails every batch of the
-partition, including a later batch held by a built request that has not been
-serialized yet.
+This uses kgo's default idempotent producer (acks=all). The broker fails
+record A's request, and kgo fails every batch of the partition. That includes
+record C's batch, which sits in a later, already-built request. kgo still
+writes that request, with `records=null` for the partition.
 
 ```
-MODE=fatal go run ./idempotence_enabled    # INVALID_RECORD (the default)
-MODE=timeout go run ./idempotence_enabled  # NOT_LEADER_OR_FOLLOWER, batch past RecordDeliveryTimeout
-MODE=cancel go run ./idempotence_enabled   # NOT_LEADER_OR_FOLLOWER, first record's ctx cancelled
-MODE=none go run ./idempotence_enabled     # the broker answers successfully; no null-records request
+go run ./idempotence_enabled
 ```
 
-Each of the three failure modes writes a null-records request on every run.
-`MODE=none` never does.
+```
+step 1: produce A, broker holds its response
+  write:   produce v13 acks=-1, partition 0, records=MARK-A
+step 2: produce B (write held), then C
+step 3: broker answers A's request
+  broker:  answering A's request with INVALID_RECORD
+  promise: A err=INVALID_RECORD: This record has failed the validation on the broker and hence been rejected.
+  promise: B err=INVALID_RECORD: ...
+  promise: C err=INVALID_RECORD: ...
+step 4: release B's write
+  write:   produce v13 acks=-1, partition 0, records=MARK-B
+  write:   produce v13 acks=-1, partition 0, records=null
+RESULT: a produce request with null records was written
+```
+
+B's request was serialized before the failure, so it is written with its
+records. C's request is serialized after the failure and is written with
+`records=null`.
+
+`MODE` selects what fails A's request. Each failure mode writes C's request
+with `records=null`:
+
+```
+go run ./idempotence_enabled               # broker answers INVALID_RECORD (not retryable)
+MODE=timeout go run ./idempotence_enabled  # A passes a 1s RecordDeliveryTimeout, broker answers NOT_LEADER_FOR_PARTITION
+MODE=cancel go run ./idempotence_enabled   # A's Produce context is cancelled, broker answers NOT_LEADER_FOR_PARTITION
+```
+
+The control runs the same steps, but the broker answers A's request
+successfully. Every request is written with its records and every promise
+succeeds:
+
+```
+MODE=none go run ./idempotence_enabled
+```
+
+```
+step 4: release B's write
+  write:   produce v13 acks=-1, partition 0, records=MARK-B
+  write:   produce v13 acks=-1, partition 0, records=MARK-C
+  ...
+RESULT: no produce request with null records was written
+```
