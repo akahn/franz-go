@@ -3,7 +3,7 @@ Null records in a produce request
 
 These two programs show kgo writing a produce request in which a partition's
 `records` field is null. This happens when kgo fails a batch after a request
-holding it was built, but before that request was serialized. Kafka 4.1
+holding it was built, but before that request was serialized. Kafka 4.2.0
 brokers throw a NullPointerException on such a request
 (`ProduceRequest.partitionSizes`) and never answer it.
 
@@ -68,7 +68,7 @@ RESULT: no produce request with null records was written
 ```
 
 kfake answers the null partition with `CORRUPT_MESSAGE`, so nothing stalls
-here. A Kafka 4.1 broker logs a NullPointerException for the request and never
+here. A Kafka 4.2.0 broker logs a NullPointerException for the request and never
 answers it.
 
 ## idempotence_enabled
